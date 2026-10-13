@@ -1,0 +1,64 @@
+name: Bridge x86 test
+on: workflow_dispatch
+
+jobs:
+  bridge:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get vcpkg at the pinned commit
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content native/torrent-bridge/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git init C:\v
+          git -C C:\v fetch --depth=1 https://github.com/microsoft/vcpkg.git $baseline
+          git -C C:\v checkout --detach $baseline
+          C:\v\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Configure and build libtorrent (long step)
+        run: cmake -S native/torrent-bridge -B build -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE=C:/v/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x86-windows-static -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build bridge
+        run: cmake --build build --config Release --parallel
+
+      - name: Run bridge tests
+        continue-on-error: true
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Install pefile
+        run: python -m pip install pefile
+
+      - name: Check imports
+        shell: python
+        run: |
+          import glob, pefile
+          path = glob.glob('build/**/hydra_torrent_bridge.dll', recursive=True)[0]
+          pe = pefile.PE(path)
+          print('file:', path)
+          print('machine:', hex(pe.FILE_HEADER.Machine), '(0x14c = 32-bit x86)')
+          suspects = {'GetSystemTimePreciseAsFileTime', 'WaitOnAddress', 'WakeByAddressSingle', 'WakeByAddressAll', 'GetCurrentThreadStackLimits', 'GetOverlappedResultEx', 'PrefetchVirtualMemory', 'DiscardVirtualMemory', 'SetThreadDescription', 'CreateFile2'}
+          entries = list(getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])) + list(getattr(pe, 'DIRECTORY_ENTRY_DELAY_IMPORT', []))
+          found = []
+          lines = []
+          for e in entries:
+              dll = e.dll.decode()
+              names = [i.name.decode() for i in e.imports if i.name]
+              print(dll, len(names), 'functions')
+              if dll.lower().startswith('api-ms-win'):
+                  print('  WARNING: api-ms-win DLL, usually missing on Win7')
+              for n in names:
+                  lines.append(dll + ' ' + n)
+                  if n in suspects:
+                      found.append((dll, n))
+          print('SUSPECTS:', found if found else 'none found')
+          open('imports.txt', 'w').write('\n'.join(lines))
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bridge-x86
+          path: |
+            build/**/hydra_torrent_bridge.dll
+            imports.txt
