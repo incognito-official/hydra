@@ -1,0 +1,94 @@
+name: Addon x86 test
+on: workflow_dispatch
+
+jobs:
+  addon:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get vcpkg at the pinned commit
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content native/torrent-bridge/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git init C:\v
+          git -C C:\v fetch --depth=1 https://github.com/microsoft/vcpkg.git $baseline
+          git -C C:\v checkout --detach $baseline
+          C:\v\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Configure and build libtorrent (long step)
+        run: cmake -S native/torrent-bridge -B build -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE=C:/v/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x86-windows-static -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build bridge
+        run: cmake --build build --config Release --parallel
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Build hydra-native for Win7 x86
+        env:
+          HYDRA_TORRENT_LIB_DIR: ${{ github.workspace }}\build\Release
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo +nightly build --release "-Zbuild-std=std,panic_abort" --target i686-win7-windows-msvc --manifest-path native/hydra-native/Cargo.toml --target-dir native/hydra-native/target
+
+      - name: Collect files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item native/hydra-native/target/i686-win7-windows-msvc/release/hydra_native.dll out/hydra-native.node
+          Copy-Item build/Release/hydra_torrent_bridge.dll out/
+          Copy-Item build/Release/torrent_bridge_test.exe out/
+
+      - name: Load the addon in Electron 22 (ia32)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force e22 | Out-Null
+          Set-Location e22
+          npm init -y | Out-Null
+          $env:npm_config_arch = 'ia32'
+          npm install electron@22
+          Set-Content check.js @(
+            "const fs = require('fs');",
+            "try { const m = require(process.argv[2]); fs.writeFileSync('result.txt', 'LOADED, exports: ' + Object.keys(m).join(', ')); }",
+            "catch (e) { fs.writeFileSync('result.txt', 'FAILED: ' + e.message); }"
+          )
+          $addon = (Resolve-Path ../out/hydra-native.node).Path
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          Start-Process -Wait -FilePath .\node_modules\electron\dist\electron.exe -ArgumentList 'check.js', $addon
+          Get-Content result.txt
+
+      - name: Install pefile
+        run: python -m pip install pefile
+
+      - name: Check addon imports
+        shell: python
+        run: |
+          import pefile
+          pe = pefile.PE('out/hydra-native.node')
+          print('machine:', hex(pe.FILE_HEADER.Machine), '(0x14c = 32-bit x86)')
+          suspects = {'GetSystemTimePreciseAsFileTime', 'WaitOnAddress', 'WakeByAddressSingle', 'WakeByAddressAll', 'GetCurrentThreadStackLimits', 'GetOverlappedResultEx', 'PrefetchVirtualMemory', 'DiscardVirtualMemory', 'SetThreadDescription', 'CreateFile2'}
+          entries = list(getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])) + list(getattr(pe, 'DIRECTORY_ENTRY_DELAY_IMPORT', []))
+          found = []
+          lines = []
+          for e in entries:
+              dll = e.dll.decode()
+              names = [i.name.decode() for i in e.imports if i.name]
+              print(dll, len(names), 'functions')
+              if dll.lower().startswith('api-ms-win'):
+                  print('  WARNING: api-ms-win DLL, usually missing on Win7')
+              for n in names:
+                  lines.append(dll + ' ' + n)
+                  if n in suspects:
+                      found.append((dll, n))
+          print('SUSPECTS:', found if found else 'none found')
+          open('imports-addon.txt', 'w').write('\n'.join(lines))
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: addon-x86
+          path: |
+            out/*
+            imports-addon.txt
