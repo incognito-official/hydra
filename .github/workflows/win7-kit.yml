@@ -1,0 +1,44 @@
+name: Win7 kit
+on: workflow_dispatch
+
+jobs:
+  kit:
+    runs-on: windows-2022
+    steps:
+      - name: Prepare Electron 22 ia32 and test scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force prep | Out-Null
+          Set-Location prep
+          npm init -y | Out-Null
+          $env:npm_config_arch = 'ia32'
+          npm install electron@22
+          New-Item -ItemType Directory -Force ../kit | Out-Null
+          Copy-Item -Recurse node_modules/electron/dist ../kit/electron
+          Set-Location ../kit
+          Set-Content check.js @(
+            "const fs = require('fs');",
+            "try { const m = require(process.argv[2]); fs.writeFileSync('addon-result.txt', 'LOADED, exports: ' + Object.keys(m).join(', ')); }",
+            "catch (e) { fs.writeFileSync('addon-result.txt', 'FAILED: ' + e.message); }"
+          )
+          $bat = @(
+            '@echo off',
+            'cd /d "%~dp0"',
+            'ver > result.txt',
+            'echo === bridge test === >> result.txt',
+            'out\torrent_bridge_test.exe >> result.txt 2>&1',
+            'echo bridge test exit code: %errorlevel% >> result.txt',
+            'echo === addon in Electron 22 === >> result.txt',
+            'del addon-result.txt 2>nul',
+            'set ELECTRON_RUN_AS_NODE=1',
+            'start /wait "" electron\electron.exe check.js "%~dp0out\hydra-native.node"',
+            'type addon-result.txt >> result.txt',
+            'echo === done === >> result.txt',
+            'notepad result.txt'
+          )
+          Set-Content run-test.bat $bat -Encoding ASCII
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win7-kit
+          path: kit
